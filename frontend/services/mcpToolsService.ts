@@ -121,7 +121,7 @@ export const fetchCommunityMcpCards = async (params: {
     cursor: params.cursor || undefined,
     transport_type: params.transportType,
     tag: params.tag?.trim() || undefined,
-    limit: params.limit ?? 30,
+    limit: params.limit ?? 6,
   });
 
   return {
@@ -290,6 +290,8 @@ export const listMcpTools = async (params?: { tag?: string }) => {
   const items = (res.data || []).map((s: any) => {
     return {
       mcpId: s.mcp_id,
+      tenantId: s.tenant_id ?? undefined,
+      crossTenantVisibility: s.cross_tenant_visibility ?? false,
       containerId: s.container_id,
       containerPort: s.container_port ?? undefined,
       name: s.service_name,
