@@ -9,7 +9,7 @@ import threading
 import unicodedata
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, unquote, urljoin
 
 from nexent.core.agents.agent_model import AgentHistory, AgentRunInfo
 from nexent.core.agents.context import (
@@ -39,6 +39,7 @@ from services.agent_draft_permission_service import (
 )
 from tool_collection.mcp.nl2agent_mcp_tools import (
     AgentDraftFields,
+    INSTALLED_RESOURCE_SOURCES,
     InstalledMcpToolRecommendation,
     NL2AGENT_AGENT_ID_HEADER,
     NL2A_MCP_LEGACY_TOOL_NAMES,
@@ -46,9 +47,11 @@ from tool_collection.mcp.nl2agent_mcp_tools import (
     RecommendResourcesOutput,
     RecommendedResource,
     ResourceCandidate,
+    ResourceInstallationOption,
     ResourceRequirement,
     ResourceSearchOutput,
     SEARCH_UNINSTALLED_RESOURCES_NAME,
+    UNINSTALLED_RESOURCE_SOURCES,
 )
 from utils.auth_utils import get_current_user_id
 from utils.config_utils import tenant_config_manager
@@ -62,6 +65,11 @@ MAX_RECOMMENDATIONS = 5
 MAX_BINDING_CANDIDATES = 12
 STRONG_RESOURCE_SCORE = 0.65
 MINIMUM_RESOURCE_SCORE = 0.50
+UNINSTALLED_SOURCE_PAGE_SIZE = 100
+MAX_INTERNAL_SOURCE_ITEMS = 300
+REGISTRY_PAGE_SIZE = 30
+REGISTRY_MAX_PAGES = 2
+REGISTRY_OFFICIAL_META_KEY = "io.modelcontextprotocol.registry/official"
 AGENT_DRAFT_FIELD_ORDER = (
     "name",
     "display_name",
@@ -464,7 +472,10 @@ async def _load_installed_resource_catalog(
                 "inputs": inputs,
             }),
             "config": _normalize_tool_config(tool.get("params")),
+            "form_kind": "TOOL_CONFIG",
             "inputs": inputs,
+            "installed": True,
+            "quality": 1.0,
         })
 
     for skill in skills:
@@ -489,7 +500,10 @@ async def _load_installed_resource_catalog(
                 "tool_ids": skill.get("tool_ids"),
             }),
             "config": _normalize_skill_config(skill),
+            "form_kind": "SKILL_CONFIG",
             "inputs": {},
+            "installed": True,
+            "quality": 1.0,
         })
     return catalog
 
@@ -532,36 +546,48 @@ def _score_resource_requirement(
         ),
         default=0,
     )
+    installed_bonus = 0.03 if resource.get("installed") else 0.0
+    quality_bonus = 0.02 * max(
+        0.0, min(1.0, float(resource.get("quality") or 0.0))
+    )
     if requirement.resource_name_hint:
-        score = 0.65 * capability_score + 0.30 * name_score + 0.05
+        score = (
+            0.65 * capability_score
+            + 0.30 * name_score
+            + installed_bonus
+            + quality_bonus
+        )
     else:
-        score = 0.82 * capability_score + 0.13 * name_score + 0.05
+        score = (
+            0.82 * capability_score
+            + 0.13 * name_score
+            + installed_bonus
+            + quality_bonus
+        )
     return min(1.0, score)
 
 
-async def search_installed_resources_impl(
+def _rank_resource_catalog(
     *,
     requirements: list[ResourceRequirement],
-    tenant_id: str,
-    user_id: str,
+    catalog: list[dict[str, Any]],
 ) -> ResourceSearchOutput:
-    """Search and rank installed resources visible to the current user."""
+    """Rank one normalized catalog and return a compact coverage set."""
 
-    catalog = await _load_installed_resource_catalog(
-        tenant_id=tenant_id,
-        user_id=user_id,
-    )
     scored: list[dict[str, Any]] = []
     strong_requirement_ids: set[str] = set()
     for resource in catalog:
         relationships = {
-            requirement.requirement_id: _score_resource_requirement(requirement, resource)
+            requirement.requirement_id: _score_resource_requirement(
+                requirement, resource
+            )
             for requirement in requirements
         }
         matched_ids = [
             requirement.requirement_id
             for requirement in requirements
-            if relationships[requirement.requirement_id] >= MINIMUM_RESOURCE_SCORE
+            if relationships[requirement.requirement_id]
+            >= MINIMUM_RESOURCE_SCORE
         ]
         if not matched_ids:
             continue
@@ -613,7 +639,8 @@ async def search_installed_resources_impl(
             item
             for item in scored
             if item["candidate"].candidate_ref not in selected_refs
-            and item["relationships"][requirement.requirement_id] >= MINIMUM_RESOURCE_SCORE
+            and item["relationships"][requirement.requirement_id]
+            >= MINIMUM_RESOURCE_SCORE
         ]
         alternatives.sort(key=lambda item: (
             -item["relationships"][requirement.requirement_id],
@@ -632,9 +659,681 @@ async def search_installed_resources_impl(
         if requirement.requirement_id not in strong_requirement_ids
     ]
     return ResourceSearchOutput(
-        candidates=[item["candidate"] for item in selected[:MAX_BINDING_CANDIDATES]],
+        candidates=[
+            item["candidate"]
+            for item in selected[:MAX_BINDING_CANDIDATES]
+        ],
         uncovered_requirement_ids=uncovered,
     )
+
+
+async def search_installed_resources_impl(
+    *,
+    requirements: list[ResourceRequirement],
+    tenant_id: str,
+    user_id: str,
+) -> ResourceSearchOutput:
+    """Search and rank installed resources visible to the current user."""
+
+    catalog = await _load_installed_resource_catalog(
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+    return _rank_resource_catalog(
+        requirements=requirements,
+        catalog=catalog,
+    )
+
+
+def _redact_installation_snapshot(value: Any, *, parent_key: str = "") -> Any:
+    """Remove persisted credentials while preserving a serializable form shape."""
+
+    normalized_parent = parent_key.casefold().replace("_", "")
+    if isinstance(value, dict):
+        secret_object = value.get("isSecret") is True
+        is_env_context = normalized_parent in {
+            "env",
+            "environment",
+            "environmentvariables",
+        }
+        is_header_context = normalized_parent in {
+            "headers",
+            "customheaders",
+        }
+        is_field_descriptor = any(
+            key in value
+            for key in (
+                "name",
+                "key",
+                "value",
+                "default",
+                "isRequired",
+                "isSecret",
+            )
+        )
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).casefold().replace("_", "")
+            is_secret_key = (
+                normalized_key != "issecret"
+                and any(
+                    marker in normalized_key
+                    for marker in ("password", "secret", "token", "apikey")
+                )
+            ) or normalized_key == "authorization"
+            if (
+                (is_env_context or is_header_context)
+                and not is_field_descriptor
+                and not isinstance(item, (dict, list))
+            ):
+                redacted[str(key)] = ""
+            elif (
+                (
+                    is_secret_key
+                    or is_env_context
+                    or is_header_context
+                    or secret_object
+                )
+                and normalized_key
+                in {"value", "default", "authorization"}
+            ):
+                redacted[str(key)] = ""
+            elif is_secret_key and not isinstance(item, (dict, list)):
+                redacted[str(key)] = ""
+            else:
+                redacted[str(key)] = _redact_installation_snapshot(
+                    item, parent_key=str(key)
+                )
+        return redacted
+    if isinstance(value, list):
+        return [
+            _redact_installation_snapshot(item, parent_key=parent_key)
+            for item in value
+        ]
+    if normalized_parent in {"env", "environment", "environmentvariables"}:
+        return ""
+    return value
+
+
+def _registry_server(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict) or not isinstance(entry.get("server"), dict):
+        return None
+    return entry["server"]
+
+
+def _registry_server_status(entry: dict[str, Any]) -> str:
+    metadata = entry.get("_meta")
+    if not isinstance(metadata, dict):
+        return ""
+    official = metadata.get(REGISTRY_OFFICIAL_META_KEY)
+    if not isinstance(official, dict):
+        return ""
+    return str(official.get("status") or "").casefold()
+
+
+def _registry_remote_transport(
+    transport_type: Any,
+    url: Any,
+) -> tuple[str, int] | None:
+    server_url = str(url or "").strip()
+    if not server_url.lower().startswith(("http://", "https://")):
+        return None
+    normalized = str(transport_type or "").strip().casefold()
+    if normalized == "sse":
+        return "sse", 1
+    if normalized in {"streamable-http", "http"}:
+        return "http", 0
+    return None
+
+
+def _has_unsupported_required_headers(headers: Any) -> bool:
+    if not isinstance(headers, list):
+        return False
+    for header in headers:
+        if not isinstance(header, dict) or header.get("isRequired") is not True:
+            continue
+        name = str(header.get("name") or header.get("key") or "").casefold()
+        if name != "authorization":
+            return True
+    return False
+
+
+def _registry_installation_options(
+    entry: dict[str, Any],
+) -> list[ResourceInstallationOption]:
+    """Return only Registry targets supported by current Nexent installers."""
+
+    server = _registry_server(entry)
+    if server is None:
+        return []
+    snapshot = _redact_installation_snapshot(entry)
+    ranked: list[tuple[int, int, ResourceInstallationOption]] = []
+    remotes = server.get("remotes")
+    if isinstance(remotes, list):
+        for index, remote in enumerate(remotes):
+            if not isinstance(remote, dict):
+                continue
+            target = _registry_remote_transport(
+                remote.get("type"), remote.get("url")
+            )
+            if target is None or _has_unsupported_required_headers(
+                remote.get("headers")
+            ):
+                continue
+            transport, priority = target
+            label = f"{transport.upper()} - {str(remote.get('url') or '').strip()}"
+            ranked.append((
+                priority,
+                index,
+                ResourceInstallationOption(
+                    option_id=f"remote-{index}",
+                    label=label,
+                    form_kind="MCP_REMOTE",
+                    config={
+                        "registry": snapshot,
+                        "option_key": f"remote-{index}",
+                    },
+                ),
+            ))
+
+    packages = server.get("packages")
+    if isinstance(packages, list):
+        for index, package in enumerate(packages):
+            if not isinstance(package, dict):
+                continue
+            identifier = str(package.get("identifier") or "").strip()
+            registry_type = str(package.get("registryType") or "").casefold()
+            transport = package.get("transport")
+            transport = transport if isinstance(transport, dict) else {}
+            remote_target = _registry_remote_transport(
+                transport.get("type"), transport.get("url")
+            )
+            if remote_target is not None:
+                if _has_unsupported_required_headers(transport.get("headers")):
+                    continue
+                normalized_transport, priority = remote_target
+                label = (
+                    f"{identifier or 'Package'} - "
+                    f"{normalized_transport.upper()}"
+                )
+                form_kind = "MCP_REMOTE"
+            elif (
+                str(transport.get("type") or "").casefold() == "stdio"
+                and registry_type in {"npm", "pypi"}
+                and identifier
+            ):
+                priority = 2
+                label = f"{identifier} - stdio"
+                form_kind = "MCP_PACKAGE"
+            else:
+                continue
+            ranked.append((
+                priority,
+                len(remotes) + index if isinstance(remotes, list) else index,
+                ResourceInstallationOption(
+                    option_id=f"package-{index}",
+                    label=label,
+                    form_kind=form_kind,
+                    config={
+                        "registry": snapshot,
+                        "option_key": f"package-{index}",
+                    },
+                ),
+            ))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2].option_id))
+    return [item[2] for item in ranked]
+
+
+def _registry_entry_to_catalog(entry: dict[str, Any]) -> dict[str, Any] | None:
+    server = _registry_server(entry)
+    if server is None or _registry_server_status(entry) != "active":
+        return None
+    name = str(server.get("name") or "").strip()
+    version = str(server.get("version") or "").strip()
+    options = _registry_installation_options(entry)
+    if not name or not version or not options:
+        return None
+    default = options[0]
+    return {
+        "candidate_ref": (
+            f"mcp_official_registry:{quote(name, safe='')}@{version}"
+        ),
+        "resource_type": "mcp_server",
+        "source": "MCP_OFFICIAL_REGISTRY",
+        "name": name,
+        "description": _collapse_whitespace(
+            str(server.get("description") or "")
+        ),
+        "names": [name],
+        "labels": [],
+        "descriptions": [str(server.get("description") or "")],
+        "interfaces": _flatten_resource_text({
+            "remotes": server.get("remotes"),
+            "packages": server.get("packages"),
+        }),
+        "installed": False,
+        "quality": 1.0,
+        "form_kind": default.form_kind,
+        "config": default.config,
+        "installation_options": options,
+        "default_option_id": default.option_id,
+    }
+
+
+async def _load_internal_uninstalled_resource_catalog(
+    *,
+    tenant_id: str,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    from services.mcp_management_service import list_community_mcp_services
+    from services.skill_repository_service import (
+        list_skill_repository_listings_impl,
+    )
+    from services.skill_service import get_official_skills_with_status
+
+    catalog: list[dict[str, Any]] = []
+    for skill in get_official_skills_with_status(tenant_id=tenant_id):
+        name = str(skill.get("name") or "").strip()
+        if skill.get("status") != "installable" or not name:
+            continue
+        option = ResourceInstallationOption(
+            option_id="official",
+            label="Install",
+            form_kind="SKILL_CONFIG",
+            config=[],
+        )
+        catalog.append({
+            "candidate_ref": f"nexent_official_skill:{quote(name, safe='')}",
+            "resource_type": "skill",
+            "source": "NEXENT_OFFICIAL_SKILL",
+            "name": name,
+            "description": _collapse_whitespace(
+                str(skill.get("description") or "")
+            ),
+            "names": [name],
+            "labels": [],
+            "descriptions": [str(skill.get("description") or "")],
+            "interfaces": [],
+            "installed": False,
+            "quality": 1.0,
+            "form_kind": option.form_kind,
+            "config": option.config,
+            "installation_options": [option],
+            "default_option_id": option.option_id,
+        })
+
+    repository_items: list[dict[str, Any]] = []
+    page = 1
+    while len(repository_items) < MAX_INTERNAL_SOURCE_ITEMS:
+        result = list_skill_repository_listings_impl(
+            tenant_id,
+            user_id=user_id,
+            status="shared",
+            page=page,
+            page_size=UNINSTALLED_SOURCE_PAGE_SIZE,
+        )
+        items = result.get("items") if isinstance(result, dict) else []
+        if not isinstance(items, list) or not items:
+            break
+        repository_items.extend(
+            item for item in items if isinstance(item, dict)
+        )
+        pagination = result.get("pagination") or {}
+        if page >= int(pagination.get("total_pages") or page):
+            break
+        page += 1
+    for item in repository_items[:MAX_INTERNAL_SOURCE_ITEMS]:
+        repository_id = item.get("skill_repository_id") or item.get("id")
+        name = str(item.get("name") or "").strip()
+        if not isinstance(repository_id, int) or repository_id <= 0 or not name:
+            continue
+        config = [{
+            "name": "target_name",
+            "type": "string",
+            "required": False,
+            "value": "",
+            "description": "Optional installed Skill name",
+        }]
+        option = ResourceInstallationOption(
+            option_id="repository",
+            label="Install a copy",
+            form_kind="SKILL_CONFIG",
+            config=config,
+        )
+        catalog.append({
+            "candidate_ref": f"tenant_skill_repository:{repository_id}",
+            "resource_type": "skill",
+            "source": "TENANT_SKILL_REPOSITORY",
+            "name": name,
+            "description": _collapse_whitespace(
+                str(item.get("description") or "")
+            ),
+            "names": [name],
+            "labels": _normalize_labels(item.get("tags")),
+            "descriptions": [
+                str(item.get("description") or ""),
+                str(item.get("content") or "")[:4000],
+            ],
+            "interfaces": [],
+            "installed": False,
+            "quality": 1.0,
+            "form_kind": option.form_kind,
+            "config": option.config,
+            "installation_options": [option],
+            "default_option_id": option.option_id,
+        })
+
+    community_items: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while len(community_items) < MAX_INTERNAL_SOURCE_ITEMS:
+        result = await list_community_mcp_services(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            cursor=cursor,
+            limit=UNINSTALLED_SOURCE_PAGE_SIZE,
+        )
+        items = result.get("items") if isinstance(result, dict) else []
+        if not isinstance(items, list) or not items:
+            break
+        community_items.extend(item for item in items if isinstance(item, dict))
+        next_cursor = result.get("nextCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            break
+        cursor = next_cursor
+    for item in community_items[:MAX_INTERNAL_SOURCE_ITEMS]:
+        market_id = item.get("marketId") or item.get("communityId")
+        name = str(item.get("name") or "").strip()
+        transport_type = str(item.get("transportType") or "").casefold()
+        if not isinstance(market_id, int) or market_id <= 0 or not name:
+            continue
+        if transport_type == "container":
+            if not isinstance(item.get("configJson"), dict):
+                continue
+            form_kind = "MCP_CONTAINER"
+        else:
+            server_url = str(item.get("serverUrl") or "").strip()
+            if not server_url.lower().startswith(("http://", "https://")):
+                continue
+            form_kind = "MCP_REMOTE"
+        draft = {
+            "name": name,
+            "description": str(item.get("description") or ""),
+            "transportType": transport_type or "url",
+            "serverUrl": str(item.get("serverUrl") or ""),
+            "authorizationToken": "",
+            "customHeaders": "",
+            "containerConfigJson": json.dumps(
+                _redact_installation_snapshot(item.get("configJson") or {}),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "containerPort": item.get("containerPort"),
+            "tags": _normalize_labels(item.get("tags")),
+            "version": item.get("version"),
+            "registryJson": _redact_installation_snapshot(
+                item.get("registryJson") or {}
+            ),
+            "marketId": market_id,
+        }
+        option = ResourceInstallationOption(
+            option_id="repository",
+            label="Install",
+            form_kind=form_kind,
+            config=draft,
+        )
+        catalog.append({
+            "candidate_ref": f"tenant_mcp_repository:{market_id}",
+            "resource_type": "mcp_server",
+            "source": "TENANT_MCP_REPOSITORY",
+            "name": name,
+            "description": _collapse_whitespace(
+                str(item.get("description") or "")
+            ),
+            "names": [name],
+            "labels": _normalize_labels(item.get("tags")),
+            "descriptions": [
+                str(item.get("description") or ""),
+                str(item.get("content") or "")[:4000],
+            ],
+            "interfaces": _flatten_resource_text({
+                "server": item.get("serverUrl"),
+                "config": item.get("configJson"),
+                "registry": item.get("registryJson"),
+            }),
+            "installed": False,
+            "quality": 1.0,
+            "form_kind": option.form_kind,
+            "config": option.config,
+            "installation_options": [option],
+            "default_option_id": option.option_id,
+        })
+    return catalog
+
+
+def _registry_lookup_term(requirement: ResourceRequirement) -> str:
+    if requirement.resource_name_hint:
+        return requirement.resource_name_hint
+    if requirement.search_terms:
+        return requirement.search_terms[0]
+    return requirement.query
+
+
+async def _load_registry_uninstalled_resource_catalog(
+    requirements: list[ResourceRequirement],
+) -> list[dict[str, Any]]:
+    from services.mcp_management_service import list_registry_mcp_services
+
+    async def search_one(requirement: ResourceRequirement) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(REGISTRY_MAX_PAGES):
+            page = await list_registry_mcp_services(
+                search=_registry_lookup_term(requirement),
+                include_deleted=False,
+                version="latest",
+                cursor=cursor,
+                limit=REGISTRY_PAGE_SIZE,
+            )
+            raw_servers = page.get("servers") if isinstance(page, dict) else []
+            entries.extend(
+                item for item in raw_servers or [] if isinstance(item, dict)
+            )
+            if any(
+                _registry_entry_to_catalog(item) is not None
+                for item in entries
+            ):
+                break
+            metadata = page.get("metadata") if isinstance(page, dict) else {}
+            next_cursor = (
+                metadata.get("nextCursor")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return entries
+
+    pages = await asyncio.gather(*(search_one(item) for item in requirements))
+    by_name: dict[str, dict[str, Any]] = {}
+    for entries in pages:
+        for entry in entries:
+            normalized = _registry_entry_to_catalog(entry)
+            if normalized is None:
+                continue
+            name_key = normalized["name"].casefold()
+            by_name.setdefault(name_key, normalized)
+    return list(by_name.values())
+
+
+async def search_uninstalled_resources_impl(
+    *,
+    requirements: list[ResourceRequirement],
+    scope: str,
+    exclude_refs: list[str],
+    tenant_id: str,
+    user_id: str,
+) -> ResourceSearchOutput:
+    """Search and rank installable resources for one controlled source scope."""
+
+    if scope == "internal":
+        catalog = await _load_internal_uninstalled_resource_catalog(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+    elif scope == "external_registry":
+        catalog = await _load_registry_uninstalled_resource_catalog(requirements)
+    else:
+        raise Nl2AgentResourceError("invalid_requirements")
+    excluded = set(exclude_refs)
+    return _rank_resource_catalog(
+        requirements=requirements,
+        catalog=[
+            item for item in catalog if item["candidate_ref"] not in excluded
+        ],
+    )
+
+
+def _verified_resource_candidate(
+    actual: dict[str, Any],
+    supplied: ResourceCandidate,
+) -> ResourceCandidate:
+    if (
+        supplied.resource_type != actual["resource_type"]
+        or supplied.source != actual["source"]
+    ):
+        raise Nl2AgentResourceError("invalid_candidates")
+    return ResourceCandidate(
+        candidate_ref=actual["candidate_ref"],
+        resource_type=actual["resource_type"],
+        source=actual["source"],
+        name=actual["name"],
+        description=actual["description"],
+        requirement_ids=supplied.requirement_ids,
+        score=supplied.score,
+    )
+
+
+def _recommended_resource(
+    *,
+    actual: dict[str, Any],
+    supplied: ResourceCandidate,
+    recommended_refs: set[str],
+) -> RecommendedResource:
+    return RecommendedResource(
+        candidate=_verified_resource_candidate(actual, supplied),
+        recommendation=(
+            "recommended"
+            if supplied.candidate_ref in recommended_refs
+            else "optional"
+        ),
+        form_kind=actual.get("form_kind") or (
+            "TOOL_CONFIG"
+            if actual["resource_type"] == "tool"
+            else "SKILL_CONFIG"
+        ),
+        config=actual["config"],
+        installation_options=actual.get("installation_options") or [],
+        default_option_id=actual.get("default_option_id"),
+    )
+
+
+def _parse_registry_candidate_ref(candidate_ref: str) -> tuple[str, str]:
+    prefix = "mcp_official_registry:"
+    if not candidate_ref.startswith(prefix):
+        raise Nl2AgentResourceError("invalid_candidates")
+    encoded_identity = candidate_ref[len(prefix):]
+    encoded_name, separator, version = encoded_identity.rpartition("@")
+    name = unquote(encoded_name)
+    if not separator or not name or not version:
+        raise Nl2AgentResourceError("invalid_candidates")
+    return name, version
+
+
+async def _resolve_registry_catalog_item(
+    candidate_ref: str,
+) -> dict[str, Any] | None:
+    from services.mcp_management_service import list_registry_mcp_services
+
+    name, version = _parse_registry_candidate_ref(candidate_ref)
+    result = await list_registry_mcp_services(
+        search=name,
+        include_deleted=False,
+        version=version,
+        limit=REGISTRY_PAGE_SIZE,
+    )
+    entries = result.get("servers") if isinstance(result, dict) else []
+    for entry in entries or []:
+        normalized = (
+            _registry_entry_to_catalog(entry)
+            if isinstance(entry, dict)
+            else None
+        )
+        if normalized is None:
+            continue
+        server = _registry_server(entry) or {}
+        if (
+            str(server.get("name") or "") == name
+            and str(server.get("version") or "") == version
+            and normalized["candidate_ref"] == candidate_ref
+        ):
+            return normalized
+    return None
+
+
+async def recommend_uninstalled_resources_impl(
+    *,
+    candidates: list[ResourceCandidate],
+    recommended_refs: list[str],
+    tenant_id: str,
+    user_id: str,
+) -> RecommendResourcesOutput:
+    """Resolve installable candidates against their current source records."""
+
+    internal_sources = {
+        "NEXENT_OFFICIAL_SKILL",
+        "TENANT_SKILL_REPOSITORY",
+        "TENANT_MCP_REPOSITORY",
+    }
+    internal_catalog: list[dict[str, Any]] = []
+    if any(candidate.source in internal_sources for candidate in candidates):
+        internal_catalog = await _load_internal_uninstalled_resource_catalog(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+    by_ref = {item["candidate_ref"]: item for item in internal_catalog}
+    registry_refs = [
+        candidate.candidate_ref
+        for candidate in candidates
+        if candidate.source == "MCP_OFFICIAL_REGISTRY"
+    ]
+    registry_items = await asyncio.gather(
+        *(_resolve_registry_catalog_item(ref) for ref in registry_refs)
+    )
+    by_ref.update({
+        item["candidate_ref"]: item
+        for item in registry_items
+        if item is not None
+    })
+    recommended = set(recommended_refs)
+    resources: list[RecommendedResource] = []
+    for supplied in candidates:
+        actual = by_ref.get(supplied.candidate_ref)
+        if actual is None:
+            raise Nl2AgentResourceError("resource_not_visible")
+        resources.append(_recommended_resource(
+            actual=actual,
+            supplied=supplied,
+            recommended_refs=recommended,
+        ))
+    return RecommendResourcesOutput(resources=resources)
 
 
 async def recommend_installed_resources_impl(
@@ -657,35 +1356,39 @@ async def recommend_installed_resources_impl(
         actual = by_ref.get(supplied.candidate_ref)
         if actual is None:
             raise Nl2AgentResourceError("resource_not_visible")
-        if (
-            supplied.resource_type != actual["resource_type"]
-            or supplied.source != actual["source"]
-        ):
-            raise Nl2AgentResourceError("invalid_candidates")
-        verified_candidate = ResourceCandidate(
-            candidate_ref=actual["candidate_ref"],
-            resource_type=actual["resource_type"],
-            source=actual["source"],
-            name=actual["name"],
-            description=actual["description"],
-            requirement_ids=supplied.requirement_ids,
-            score=supplied.score,
-        )
-        resources.append(RecommendedResource(
-            candidate=verified_candidate,
-            recommendation=(
-                "recommended"
-                if supplied.candidate_ref in recommended
-                else "optional"
-            ),
-            form_kind=(
-                "TOOL_CONFIG"
-                if actual["resource_type"] == "tool"
-                else "SKILL_CONFIG"
-            ),
-            config=actual["config"],
+        resources.append(_recommended_resource(
+            actual=actual,
+            supplied=supplied,
+            recommended_refs=recommended,
         ))
     return RecommendResourcesOutput(resources=resources)
+
+
+async def recommend_resources_impl(
+    *,
+    candidates: list[ResourceCandidate],
+    recommended_refs: list[str],
+    tenant_id: str,
+    user_id: str,
+) -> RecommendResourcesOutput:
+    """Dispatch a homogeneous candidate set to its trusted source resolver."""
+
+    sources = {candidate.source for candidate in candidates}
+    if sources and sources.issubset(INSTALLED_RESOURCE_SOURCES):
+        return await recommend_installed_resources_impl(
+            candidates=candidates,
+            recommended_refs=recommended_refs,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+    if sources and sources.issubset(UNINSTALLED_RESOURCE_SOURCES):
+        return await recommend_uninstalled_resources_impl(
+            candidates=candidates,
+            recommended_refs=recommended_refs,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+    raise Nl2AgentResourceError("invalid_candidates")
 
 
 def _parse_nl2agent_card_action_agent_id(query: str) -> int | None:

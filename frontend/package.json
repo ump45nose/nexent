@@ -11,6 +11,7 @@
     "lint:fix": "next lint --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "test:e2e:nl2agent-installation": "playwright test e2e/nl2agent-installation.spec.ts",
     "type-check": "tsc --noEmit",
     "check-all": "npm run type-check && npm run lint && npm run format:check && npm run build"
   },
@@ -79,6 +80,7 @@
     "zustand": "^5.0.9"
   },
   "devDependencies": {
+    "@playwright/test": "1.51.1",
     "@tailwindcss/postcss": "^4",
     "@types/js-yaml": "^4.0.9",
     "@types/mdast": "4.0.4",

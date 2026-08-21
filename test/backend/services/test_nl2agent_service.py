@@ -18,12 +18,15 @@ from services.nl2agent_service import (
     _load_installed_resource_catalog,
     _normalize_skill_config,
     _normalize_tool_config,
+    _registry_entry_to_catalog,
     _resource_similarity,
     build_nl2agent_run_info,
     create_nl2agent_stream,
     recommend_installed_resources_impl,
+    recommend_uninstalled_resources_impl,
     save_agent_draft_fields_impl,
     search_installed_resources_impl,
+    search_uninstalled_resources_impl,
     search_installed_mcp_tools_by_query,
     validate_agent_generation_complete_impl,
 )
@@ -606,6 +609,314 @@ def test_resource_config_normalization_is_frontend_safe():
         {"name": "region", "type": "string", "required": True, "value": "eu"}
     ]
     assert _resource_similarity("", "search") == 0
+
+
+@pytest.mark.asyncio
+async def test_search_internal_uninstalled_resources_aggregates_sources_and_excludes_refs(
+    mocker,
+):
+    mocker.patch(
+        "services.skill_service.get_official_skills_with_status",
+        return_value=[
+            {
+                "skill_id": 0,
+                "name": "daily-report",
+                "description": "Create daily reports",
+                "status": "installable",
+            },
+            {
+                "skill_id": 9,
+                "name": "installed-skill",
+                "description": "Already installed",
+                "status": "installed",
+            },
+        ],
+    )
+    mocker.patch(
+        "services.skill_repository_service.list_skill_repository_listings_impl",
+        return_value={
+            "items": [
+                {
+                    "skill_repository_id": 31,
+                    "name": "email-report",
+                    "description": "Send reports by email",
+                    "content": "email report delivery",
+                    "tags": ["email"],
+                }
+            ],
+            "pagination": {"total_pages": 1},
+        },
+    )
+    mocker.patch(
+        "services.mcp_management_service.list_community_mcp_services",
+        new=AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "marketId": 42,
+                        "name": "github-search",
+                        "description": "Search GitHub projects",
+                        "content": "GitHub repository search",
+                        "transportType": "url",
+                        "serverUrl": "https://mcp.example.test/mcp",
+                        "authorizationToken": "persisted-secret",
+                        "customHeaders": {"X-Secret": "persisted-secret"},
+                        "tags": ["github"],
+                    }
+                ],
+                "nextCursor": None,
+            }
+        ),
+    )
+
+    result = await search_uninstalled_resources_impl(
+        requirements=[
+            ResourceRequirement(
+                requirement_id="github",
+                query="GitHub project search",
+                search_terms=["github-search"],
+            ),
+            ResourceRequirement(
+                requirement_id="email",
+                query="email report delivery",
+                search_terms=["email-report"],
+            ),
+        ],
+        scope="internal",
+        exclude_refs=["nexent_official_skill:daily-report"],
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+
+    refs = {candidate.candidate_ref for candidate in result.candidates}
+    assert "nexent_official_skill:daily-report" not in refs
+    assert refs == {
+        "tenant_skill_repository:31",
+        "tenant_mcp_repository:42",
+    }
+    assert result.uncovered_requirement_ids == []
+
+
+def _registry_entry(
+    *,
+    name="io.example/search",
+    version="1.2.3",
+    status="active",
+    remotes=None,
+    packages=None,
+):
+    return {
+        "server": {
+            "name": name,
+            "version": version,
+            "description": "Search verified project data",
+            "remotes": remotes or [],
+            "packages": packages or [],
+        },
+        "_meta": {
+            "io.modelcontextprotocol.registry/official": {"status": status}
+        },
+    }
+
+
+def test_registry_catalog_requires_active_supported_installation():
+    assert _registry_entry_to_catalog(
+        _registry_entry(
+            status="deprecated",
+            remotes=[{"type": "streamable-http", "url": "https://x/mcp"}],
+        )
+    ) is None
+    assert _registry_entry_to_catalog(
+        _registry_entry(
+            packages=[{
+                "registryType": "cargo",
+                "identifier": "search-server",
+                "transport": {"type": "stdio"},
+            }]
+        )
+    ) is None
+    assert _registry_entry_to_catalog(
+        _registry_entry(
+            remotes=[{"type": "websocket", "url": "https://x/socket"}],
+        )
+    ) is None
+    assert _registry_entry_to_catalog(
+        _registry_entry(
+            remotes=[{
+                "type": "streamable-http",
+                "url": "https://x/mcp",
+                "headers": [{"name": "X-API-Key", "isRequired": True}],
+            }]
+        )
+    ) is None
+
+    catalog = _registry_entry_to_catalog(
+        _registry_entry(
+            remotes=[{"type": "sse", "url": "https://x/sse"}],
+            packages=[{
+                "registryType": "npm",
+                "identifier": "@example/search",
+                "transport": {"type": "stdio"},
+            }],
+        )
+    )
+    assert catalog is not None
+    assert catalog["candidate_ref"] == (
+        "mcp_official_registry:io.example%2Fsearch@1.2.3"
+    )
+    assert [option.option_id for option in catalog["installation_options"]] == [
+        "remote-0",
+        "package-0",
+    ]
+
+    package_remote = _registry_entry_to_catalog(
+        _registry_entry(
+            packages=[{
+                "registryType": "npm",
+                "identifier": "@example/search",
+                "transport": {
+                    "type": "streamable-http",
+                    "url": "https://x/mcp",
+                },
+            }],
+        )
+    )
+    assert package_remote is not None
+    assert package_remote["installation_options"][0].form_kind == "MCP_REMOTE"
+
+
+def test_registry_installation_snapshot_redacts_headers_and_environment_values():
+    catalog = _registry_entry_to_catalog(
+        _registry_entry(
+            remotes=[{
+                "type": "streamable-http",
+                "url": "https://x/mcp",
+                "headers": [{
+                    "name": "Authorization",
+                    "isRequired": True,
+                    "value": "Bearer persisted-secret",
+                }],
+            }],
+            packages=[{
+                "registryType": "npm",
+                "identifier": "@example/search",
+                "transport": {"type": "stdio"},
+                "environmentVariables": [{
+                    "name": "API_URL",
+                    "value": "persisted-secret",
+                }],
+            }],
+        )
+    )
+
+    assert catalog is not None
+    snapshot = catalog["installation_options"][0].config["registry"]
+    header = snapshot["server"]["remotes"][0]["headers"][0]
+    assert header["name"] == "Authorization"
+    assert header["isRequired"] is True
+    assert header["value"] == ""
+    assert (
+        snapshot["server"]["packages"][0]["environmentVariables"][0]["value"]
+        == ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_registry_search_uses_latest_and_second_page_only_after_filtering(
+    mocker,
+):
+    unsupported = _registry_entry(
+        packages=[{
+            "registryType": "cargo",
+            "identifier": "unsupported",
+            "transport": {"type": "stdio"},
+        }]
+    )
+    supported = _registry_entry(
+        name="io.example/github-search",
+        remotes=[{
+            "type": "streamable-http",
+            "url": "https://github.example.test/mcp",
+        }],
+    )
+    registry = mocker.patch(
+        "services.mcp_management_service.list_registry_mcp_services",
+        new=AsyncMock(
+            side_effect=[
+                {"servers": [unsupported], "metadata": {"nextCursor": "page-2"}},
+                {"servers": [supported], "metadata": {}},
+            ]
+        ),
+    )
+
+    result = await search_uninstalled_resources_impl(
+        requirements=[ResourceRequirement(
+            requirement_id="github",
+            query="GitHub project search",
+            search_terms=["github-search", "github"],
+        )],
+        scope="external_registry",
+        exclude_refs=[],
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+
+    assert [item.candidate_ref for item in result.candidates] == [
+        "mcp_official_registry:io.example%2Fgithub-search@1.2.3"
+    ]
+    assert registry.await_count == 2
+    assert registry.await_args_list[0].kwargs["version"] == "latest"
+    assert registry.await_args_list[0].kwargs["limit"] == 30
+    assert registry.await_args_list[1].kwargs["cursor"] == "page-2"
+
+
+@pytest.mark.asyncio
+async def test_recommend_uninstalled_resources_overwrites_snapshot_and_redacts_secrets(
+    mocker,
+):
+    actual = {
+        "candidate_ref": "tenant_mcp_repository:42",
+        "resource_type": "mcp_server",
+        "source": "TENANT_MCP_REPOSITORY",
+        "name": "verified-name",
+        "description": "Verified description",
+        "form_kind": "MCP_REMOTE",
+        "config": {"authorizationToken": ""},
+        "installation_options": [
+            {
+                "option_id": "repository",
+                "label": "Install",
+                "form_kind": "MCP_REMOTE",
+                "config": {"authorizationToken": ""},
+            }
+        ],
+        "default_option_id": "repository",
+    }
+    mocker.patch(
+        "services.nl2agent_service._load_internal_uninstalled_resource_catalog",
+        new=AsyncMock(return_value=[actual]),
+    )
+    supplied = ResourceCandidate(
+        candidate_ref="tenant_mcp_repository:42",
+        resource_type="mcp_server",
+        source="TENANT_MCP_REPOSITORY",
+        name="tampered-name",
+        description="Tampered description",
+        requirement_ids=["search"],
+        score=0.91,
+    )
+
+    result = await recommend_uninstalled_resources_impl(
+        candidates=[supplied],
+        recommended_refs=[supplied.candidate_ref],
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+
+    resource = result.resources[0]
+    assert resource.candidate.name == "verified-name"
+    assert resource.config == {"authorizationToken": ""}
+    assert resource.default_option_id == "repository"
 
 
 @pytest.mark.asyncio

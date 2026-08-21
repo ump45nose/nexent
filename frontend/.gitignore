@@ -34,3 +34,7 @@ package-lock.json
 *.DS_Store
 
 nexent-dist/
+
+# Playwright
+/playwright-report/
+/test-results/
